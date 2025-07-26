@@ -1,0 +1,301 @@
+# -*- coding: utf-8 -*-
+"""
+Complete and Corrected Code for Stage 1: AdaIN Style Transfer GAN.
+
+This version includes ROBUST functionality to automatically find the latest
+checkpoint and resume training, handling both model and optimizer states,
+and is backward-compatible with older checkpoints.
+
+Author: Your Name
+Date: July 25, 2025
+"""
+
+# ## 1. IMPORTS ##
+# =================================================================================
+print("🚀 Starting up... Importing necessary libraries.")
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision.transforms as transforms
+import torchvision.models as models
+from torchvision.utils import save_image
+
+from PIL import Image
+import os
+import re # Import regular expressions to find epoch numbers
+from tqdm import tqdm
+import time
+
+# ## 2. CONFIGURATION ##
+# =================================================================================
+# A good practice is to keep all your hyperparameters and settings in one place.
+class Config:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --- Training Hyperparameters ---
+    LEARNING_RATE = 1e-4  # The step size for optimizers.
+    BETA1 = 0.5           # Adam optimizer parameter.
+    BETA2 = 0.999         # Adam optimizer parameter.
+    NUM_EPOCHS = 150      # How many times to loop over the entire dataset.
+    BATCH_SIZE = 16        # How many images to process at once.
+    LOAD_MODEL = True     # Set to True to load the latest checkpoint and resume training
+
+    # --- Loss Weights ---
+    LAMBDA_STYLE = 10.0
+    LAMBDA_CONTENT = 1.0
+    LAMBDA_ADV = 1.0
+
+    # --- Dataset and Paths ---
+    # !!! IMPORTANT: UPDATE THESE PATHS TO YOUR FOLDERS !!!
+    CONTENT_DIR = "/content/drive/MyDrive/AnimeGANv3/dataset/train_photo"   # Folder with real-world photos.
+    STYLE_DIR = "/content/drive/MyDrive/AnimeGANv3/dataset/Shinkai/style" # Folder with Shinkai-style images.
+
+    # --- Output Directories ---
+    OUTPUT_DIR = "/content/drive/MyDrive/AnimeGANv3/Outputs/" # Main folder to save results.
+    CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
+    SAMPLE_DIR = os.path.join(OUTPUT_DIR, "samples")
+
+    # --- Other Settings ---
+    IMAGE_SIZE = 256
+    LOG_INTERVAL = 100
+    SAVE_EPOCH_INTERVAL = 5
+
+# Create the output directories if they don't exist
+os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(Config.SAMPLE_DIR, exist_ok=True)
+
+print(f"✅ Configuration loaded. Using device: {Config.DEVICE}")
+
+
+# ## 3. MODEL ARCHITECTURE ##
+# =================================================================================
+# (Model architecture code remains unchanged)
+class AdaIN(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, content_feat, style_feat):
+        assert content_feat.size()[:2] == style_feat.size()[:2], "Batch and Channel dims must match"
+        B, C, H, W = content_feat.size()
+        style_mean = torch.mean(style_feat.view(B, C, -1), dim=2).view(B, C, 1, 1)
+        style_std = torch.std(style_feat.view(B, C, -1), dim=2).view(B, C, 1, 1) + 1e-6
+        content_mean = torch.mean(content_feat.view(B, C, -1), dim=2).view(B, C, 1, 1)
+        content_std = torch.std(content_feat.view(B, C, -1), dim=2).view(B, C, 1, 1) + 1e-6
+        normalized_content = (content_feat - content_mean) / content_std
+        return normalized_content * style_std + style_mean
+
+class VGGEncoder(nn.Module):
+    def __init__(self, vgg_model):
+        super().__init__()
+        self.encoder = nn.Sequential(*list(vgg_model.features.children())[:21])
+    def forward(self, x):
+        return self.encoder(x)
+
+class Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(512, 256, 3), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(256, 256, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(256, 256, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(256, 256, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(256, 128, 3), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(128, 128, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(128, 64, 3), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(64, 64, 3), nn.ReLU(),
+            nn.ReflectionPad2d((1, 1, 1, 1)), nn.Conv2d(64, 3, 3),
+            nn.Tanh()
+        )
+    def forward(self, x): return self.model(x)
+
+class Discriminator(nn.Module):
+    def __init__(self, in_channels=3):
+        super(Discriminator, self).__init__()
+        def block(i, o, n=True):
+            L = [nn.Conv2d(i, o, 4, 2, 1)]
+            if n: L.append(nn.InstanceNorm2d(o))
+            L.append(nn.LeakyReLU(0.2, inplace=True))
+            return L
+        self.model = nn.Sequential(*block(in_channels, 64, False), *block(64, 128), *block(128, 256), *block(256, 512), nn.Conv2d(512, 1, 4, 1, 1))
+    def forward(self, img): return self.model(img)
+
+print("✅ Model architectures defined.")
+
+# ## 4. DATASET & LOSS FUNCTIONS ##
+# =================================================================================
+# (This section remains unchanged)
+class ArtDataset(Dataset):
+    def __init__(self, content_dir, style_dir, transform=None):
+        self.content_dir = content_dir
+        self.style_dir = style_dir
+        self.content_files = [os.path.join(content_dir, f) for f in os.listdir(content_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+        self.style_files = [os.path.join(style_dir, f) for f in os.listdir(style_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+        self.transform = transform
+        self.content_len = len(self.content_files)
+        self.style_len = len(self.style_files)
+    def __len__(self): return self.content_len
+    def __getitem__(self, index):
+        content_path = self.content_files[index % self.content_len]
+        style_path = self.style_files[torch.randint(0, self.style_len, (1,)).item()]
+        content_img = Image.open(content_path).convert("RGB")
+        style_img = Image.open(style_path).convert("RGB")
+        if self.transform:
+            content_img = self.transform(content_img)
+            style_img = self.transform(style_img)
+        return content_img, style_img
+
+def gram_matrix(t): B, C, H, W = t.size(); f = t.view(B, C, H*W); return torch.bmm(f, f.transpose(1, 2)).div(B*C*H*W)
+def calculate_content_loss(a, b): return F.mse_loss(a, b)
+def calculate_style_loss(a, b): return F.mse_loss(gram_matrix(a), gram_matrix(b))
+
+print("✅ Dataset and Loss functions defined.")
+
+# ## 5. MAIN TRAINING SCRIPT ##
+# =================================================================================
+print("🔥 Initializing training components...")
+
+# --- 5.1. Initialization ---
+vgg_full = models.vgg19(weights=models.VGG19_Weights.DEFAULT).to(Config.DEVICE)
+encoder = VGGEncoder(vgg_full).eval()
+decoder = Decoder().to(Config.DEVICE)
+discriminator = Discriminator().to(Config.DEVICE)
+vgg_loss_net = nn.Sequential(*list(vgg_full.features.children())[:31]).eval()
+for param in vgg_loss_net.parameters(): param.requires_grad = False
+
+optimizer_D = optim.Adam(discriminator.parameters(), lr=Config.LEARNING_RATE, betas=(Config.BETA1, Config.BETA2))
+optimizer_G = optim.Adam(decoder.parameters(), lr=Config.LEARNING_RATE, betas=(Config.BETA1, Config.BETA2))
+adversarial_loss = nn.MSELoss()
+
+# --- 5.2. Checkpoint Loading (MODIFIED for robustness) ---
+start_epoch = 0
+if Config.LOAD_MODEL:
+    checkpoint_files = [f for f in os.listdir(Config.CHECKPOINT_DIR) if "decoder_epoch_" in f]
+    if checkpoint_files:
+        latest_epoch = -1
+        for f in checkpoint_files:
+            match = re.search(r'decoder_epoch_(\d+)\.pth', f)
+            if match: latest_epoch = max(latest_epoch, int(match.group(1)))
+
+        if latest_epoch != -1:
+            decoder_path = os.path.join(Config.CHECKPOINT_DIR, f"decoder_epoch_{latest_epoch}.pth")
+            discriminator_path = os.path.join(Config.CHECKPOINT_DIR, f"discriminator_epoch_{latest_epoch}.pth")
+            optimizer_g_path = os.path.join(Config.CHECKPOINT_DIR, f"optimizer_g_epoch_{latest_epoch}.pth") # MODIFIED
+            optimizer_d_path = os.path.join(Config.CHECKPOINT_DIR, f"optimizer_d_epoch_{latest_epoch}.pth") # MODIFIED
+
+            # Check if all required files exist before trying to load
+            if os.path.exists(decoder_path) and os.path.exists(discriminator_path) and os.path.exists(optimizer_g_path) and os.path.exists(optimizer_d_path):
+                print(f"🔄 Resuming training from epoch {latest_epoch}...")
+                decoder.load_state_dict(torch.load(decoder_path, map_location=Config.DEVICE))
+                discriminator.load_state_dict(torch.load(discriminator_path, map_location=Config.DEVICE))
+                optimizer_G.load_state_dict(torch.load(optimizer_g_path))
+                optimizer_D.load_state_dict(torch.load(optimizer_d_path))
+                start_epoch = latest_epoch
+                print("✅ Full checkpoint and optimizer states loaded successfully.")
+            elif os.path.exists(decoder_path) and os.path.exists(discriminator_path):
+                 print(f"🔄 Resuming training from epoch {latest_epoch} (models only)...")
+                 decoder.load_state_dict(torch.load(decoder_path, map_location=Config.DEVICE))
+                 discriminator.load_state_dict(torch.load(discriminator_path, map_location=Config.DEVICE))
+                 start_epoch = latest_epoch
+                 print("✅ Model checkpoints loaded successfully. Optimizer states not found, starting optimizers from scratch.")
+            else:
+                print(f"🤔 Found model checkpoints for epoch {latest_epoch}, but couldn't find optimizer states. Starting from scratch to be safe.")
+        else:
+            print("🤔 No valid checkpoint files found, starting from scratch.")
+    else:
+        print("🤔 No checkpoints found, starting from scratch.")
+
+# Data Transformations and Loaders
+transform = transforms.Compose([
+    transforms.Resize(Config.IMAGE_SIZE), transforms.CenterCrop(Config.IMAGE_SIZE),
+    transforms.ToTensor(), transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+])
+dataset = ArtDataset(Config.CONTENT_DIR, Config.STYLE_DIR, transform=transform)
+dataloader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+
+print("✅ Initialization complete. Starting training loop...")
+
+# --- 5.3. The Training Loop ---
+start_time = time.time()
+for epoch in range(start_epoch, Config.NUM_EPOCHS):
+    epoch_g_loss, epoch_d_loss = 0.0, 0.0
+    progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{Config.NUM_EPOCHS}")
+
+    for i, (content_imgs, style_imgs) in progress_bar:
+        content_imgs, style_imgs = content_imgs.to(Config.DEVICE), style_imgs.to(Config.DEVICE)
+
+        # --- Generate Stylized Image ---
+        with torch.no_grad():
+            content_features, style_features = encoder(content_imgs), encoder(style_imgs)
+        stylized_features = AdaIN()(content_features, style_features)
+        generated_imgs = decoder(stylized_features)
+
+        # --- Train Discriminator ---
+        optimizer_D.zero_grad()
+        real_output = discriminator(style_imgs)
+        loss_d_real = adversarial_loss(real_output, torch.ones_like(real_output))
+        fake_output = discriminator(generated_imgs.detach())
+        loss_d_fake = adversarial_loss(fake_output, torch.zeros_like(fake_output))
+        d_loss = (loss_d_real + loss_d_fake) / 2
+        d_loss.backward()
+        optimizer_D.step()
+
+        # --- Train Generator (Decoder) ---
+        optimizer_G.zero_grad()
+        fake_output_for_g = discriminator(generated_imgs)
+        loss_g_adv = Config.LAMBDA_ADV * adversarial_loss(fake_output_for_g, torch.ones_like(fake_output_for_g))
+        gen_vgg_features = vgg_loss_net(generated_imgs)
+        with torch.no_grad():
+            content_vgg_features = vgg_loss_net(content_imgs)
+            style_vgg_features = vgg_loss_net(style_imgs)
+        loss_g_content = Config.LAMBDA_CONTENT * calculate_content_loss(gen_vgg_features, content_vgg_features)
+        loss_g_style = Config.LAMBDA_STYLE * calculate_style_loss(gen_vgg_features, style_vgg_features)
+        g_loss = loss_g_adv + loss_g_content + loss_g_style
+        g_loss.backward()
+        optimizer_G.step()
+
+
+        epoch_g_loss += g_loss.item()
+        epoch_d_loss += d_loss.item()
+        if (i+1) % Config.LOG_INTERVAL == 0: progress_bar.set_postfix({'G_Loss': g_loss.item(), 'D_Loss': d_loss.item()})
+
+    avg_g_loss = epoch_g_loss / len(dataloader)
+    avg_d_loss = epoch_d_loss / len(dataloader)
+    print(f"\nEnd of Epoch {epoch+1}. Avg G_Loss: {avg_g_loss:.4f}, Avg D_Loss: {avg_d_loss:.4f}, Time: {(time.time() - start_time)/60:.2f} mins")
+
+    if (epoch + 1) % Config.SAVE_EPOCH_INTERVAL == 0:
+      # --- Save Sample Images (MODIFIED) ---
+      # We will now save each image in the batch separately and upscale it to 512x512.
+
+      # 1. Define the upscaling transformation.
+      upscale_transform = transforms.Resize((512, 512), antialias=True)
+
+      # 2. Loop through each image in the generated batch.
+      for i, img_tensor in enumerate(generated_imgs):
+          # 3. Un-normalize the image from [-1, 1] back to [0, 1].
+          unnormalized_img = (img_tensor * 0.5) + 0.5
+
+          # 4. Apply the upscale transform.
+          high_res_img = upscale_transform(unnormalized_img)
+
+          # 5. Create a unique filename for each separate image.
+          unique_filename = f"epoch_{epoch+1}_img_{i}.png"
+
+          # 6. Save the single, high-resolution image.
+          save_image(high_res_img, os.path.join(Config.SAMPLE_DIR, unique_filename))
+
+      print(f"🖼️ Saved {len(generated_imgs)} upscaled sample images for epoch {epoch+1}.")
+
+      # --- Save Model and Optimizer Checkpoints ---
+      # This part remains the same.
+      torch.save(decoder.state_dict(), os.path.join(Config.CHECKPOINT_DIR, f"decoder_epoch_{epoch+1}.pth"))
+      torch.save(discriminator.state_dict(), os.path.join(Config.CHECKPOINT_DIR, f"discriminator_epoch_{epoch+1}.pth"))
+      torch.save(optimizer_G.state_dict(), os.path.join(Config.CHECKPOINT_DIR, f"optimizer_g_epoch_{epoch+1}.pth"))
+      torch.save(optimizer_D.state_dict(), os.path.join(Config.CHECKPOINT_DIR, f"optimizer_d_epoch_{epoch+1}.pth"))
+      print(f"💾 Saved model and optimizer checkpoints for epoch {epoch+1}.")
+
+print("🎉🎉🎉 Training finished successfully! 🎉🎉🎉")
